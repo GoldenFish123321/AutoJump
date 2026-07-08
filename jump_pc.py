@@ -26,15 +26,14 @@
 
 用法（在本目录下）：
     pip install -r requirements.txt
-    python jump_pc.py run        # 自动跳（首次运行会自动识别区域；若自动识别失败则手动框选）
+    python jump_pc.py            # 自动跳（默认；自动识别区域；若自动识别失败则手动框选）
     python jump_pc.py test       # 截一帧看识别对不对，会存 debug 标注图
-    python jump_pc.py region     # 单独重新识别游戏区域（查找标题含"跳一跳"的窗口）
 
 自动识别区域：通过 Windows API 查找标题包含"跳一跳"的窗口，获取窗口**客户区**
 （GetClientRect + ClientToScreen，已自动排除标题栏和边框）作为游戏区域。
 W（游戏短边像素）= min(宽, 高) − WINDOW_UI_OFFSET，用于物理公式计算 k 值。
 （客户区已无窗口外框，WINDOW_UI_OFFSET 默认为 0；若模拟器内部有边栏可设正值扣除。）
-识别结果会存进 config.json 复用。匹配预览图会存到 debug/region_match.png。
+匹配预览图会存到 debug/region_match.png。
 若自动识别失败（如窗口标题不含"跳一跳"），会回退到手动框选模式。
 若需匹配其他窗口标题，修改脚本顶部 WINDOW_TITLE 常量即可。
 
@@ -48,7 +47,6 @@ k 值由游戏窗口短边像素 W 通过正交相机公式精确计算，无需
 
 import os
 import sys
-import json
 import time
 import math
 import random
@@ -72,7 +70,6 @@ except ImportError:
     sys.exit("缺少 pynput，请先运行: pip install -r requirements.txt")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(HERE, "config.json")
 DEBUG_DIR = os.path.join(HERE, "debug")
 
 # --- 棋子颜色范围（默认皮肤，深蓝灰“小人”），沿用 wangshub 的经验值 ---
@@ -242,16 +239,6 @@ def set_dpi_aware():
         except Exception:
             pass
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-
 def grab(sct, region):
     """region = [left, top, width, height]，返回 RGB ndarray。"""
     l, t, w, h = region
@@ -381,23 +368,22 @@ def auto_detect_region(save_debug=True):
 
     return region, info
 
-def resolve_region(cfg, allow_auto=True):
-    """每次优先通过窗口标题自动识别区域；失败则用已存区域兜底。"""
-    if allow_auto:
-        region, info = auto_detect_region()
-        if region:
-            W = min(region[2], region[3]) - WINDOW_UI_OFFSET
-            k = calc_k(W)
-            print(f"自动识别区域: {region}  (窗口: {info.get('window_title', '?')}, W={W}, k={k:.3f})")
-            cfg["region"] = region
-            save_config(cfg)
-            return region
-        print(f"自动识别失败：{info}")
-    # 兜底：用已保存的区域
-    if cfg.get("region"):
-        print(f"使用已保存区域: {cfg['region']}")
-        return cfg["region"]
-    return None
+def detect_region():
+    """自动识别游戏区域；失败则回退到手动框选。返回 region 或 sys.exit。"""
+    region, info = auto_detect_region()
+    if region:
+        W = min(region[2], region[3]) - WINDOW_UI_OFFSET
+        k = calc_k(W)
+        print(f"自动识别区域: {region}  (窗口: {info.get('window_title', '?')}, W={W}, k={k:.3f})")
+        return region
+    print(f"自动识别失败：{info}")
+    print("改用手动框选……")
+    region = select_region()
+    if not region:
+        sys.exit("已取消。")
+    W = min(region[2], region[3]) - WINDOW_UI_OFFSET
+    print(f"手动区域: {region}, 短边 W={W}")
+    return region
 
 def find_center_dot(img_rgb, near_xy, top_ignore, scale):
     """
@@ -547,34 +533,8 @@ def annotate(img_rgb, det, dist=None, info_lines=None):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
     return im
 
-def cmd_region():
-    region, info = auto_detect_region()
-    if region is None:
-        print(f"自动识别失败：{info}")
-        print("改用手动框选……")
-        region = select_region()
-        if not region:
-            print("已取消。")
-            return
-        # 手动框选后也做短边修正提示
-        W = min(region[2], region[3]) - WINDOW_UI_OFFSET
-        print(f"手动区域: {region}, 短边 W={W}")
-    else:
-        W = min(region[2], region[3]) - WINDOW_UI_OFFSET
-        k = calc_k(W)
-        print(f"自动识别区域: {region}  (窗口: {info.get('window_title', '?')}, W={W}, k={k:.3f})")
-        print(f"匹配预览已存: {os.path.join(DEBUG_DIR, 'region_match.png')} （核对黄框是否贴合游戏画面）")
-    cfg = load_config()
-    cfg["region"] = region
-    save_config(cfg)
-    print(f"已保存区域 -> {CONFIG_PATH}")
-    print("接着运行:  python jump_pc.py run   （或先 python jump_pc.py test 测识别）")
-
 def cmd_test():
-    cfg = load_config()
-    region = resolve_region(cfg)
-    if not region:
-        sys.exit("没有可用区域，请先运行: python jump_pc.py region")
+    region = detect_region()
     os.makedirs(DEBUG_DIR, exist_ok=True)
     with mss.MSS() as sct:
         img = grab(sct, region)
@@ -603,9 +563,8 @@ def cmd_test():
     print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
 
 class Runner:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.region = cfg["region"]
+    def __init__(self, region):
+        self.region = region
         # 游戏窗口短边（已扣除外层 UI），用于精确计算 k
         self.W = min(self.region[2], self.region[3]) - WINDOW_UI_OFFSET
         # k = √(2/3) · W · 736 / (414 · 60)，由正交相机参数精确计算，无需手动调整
@@ -805,19 +764,8 @@ class Runner:
         print("已退出。")
 
 def cmd_run():
-    cfg = load_config()
-    region = resolve_region(cfg, allow_auto=True)
-    if not region:
-        # 自动识别失败，回退到手动框选（融合 region 步骤）
-        print("自动识别失败，改用手动框选……")
-        region = select_region()
-        if not region:
-            sys.exit("已取消。")
-        W = min(region[2], region[3]) - WINDOW_UI_OFFSET
-        print(f"手动区域: {region}, 短边 W={W}")
-    cfg["region"] = region
-    save_config(cfg)
-    runner = Runner(cfg)
+    region = detect_region()
+    runner = Runner(region)
     listener = keyboard.Listener(on_press=runner.on_key)
     listener.start()
     try:
@@ -829,12 +777,10 @@ def main():
     set_dpi_aware()
     ap = argparse.ArgumentParser(description="跳一跳 电脑端自动脚本（图像识别）")
     ap.add_argument("cmd", nargs="?", default="run",
-                    choices=["region", "test", "run"],
-                    help="run=自动跳（默认，首次自动识别区域）  test=测识别  region=仅重设区域")
+                    choices=["test", "run"],
+                    help="run=自动跳（默认）  test=测识别")
     args = ap.parse_args()
-    if args.cmd == "region":
-        cmd_region()
-    elif args.cmd == "test":
+    if args.cmd == "test":
         cmd_test()
     else:
         cmd_run()

@@ -112,19 +112,7 @@ $$p_{\text{实际}} = p_{\text{名义}} \times f,\quad f \sim \text{Tri}(1-r,\ 1
 pip install -r requirements.txt
 ```
 
-### 第一步：自动识别游戏区域
-
-脚本通过 Windows API 自动查找标题包含「跳一跳」的窗口，获取**客户区**（`GetClientRect` + `ClientToScreen`，已自动排除标题栏和边框）作为游戏区域。
-
-```bash
-python jump_pc.py region
-```
-
-识别结果存入 `config.json`，匹配预览图存到 `debug/region_match.png`（黄框标注）。
-
-若自动识别失败（窗口标题不含"跳一跳"），会回退到**手动框选**模式。也可修改脚本顶部 `WINDOW_TITLE` 常量匹配其他窗口标题。若模拟器内部有边栏，可设置 `WINDOW_UI_OFFSET` 扣除。
-
-### 第二步：测试识别
+### 第一步：测试识别（可选）
 
 ```bash
 python jump_pc.py test
@@ -135,13 +123,15 @@ python jump_pc.py test
 - 🔴 红点 = 目标中心
 - 🟣 品红 = 完美白点（F5F5F5）
 
-### 第三步：自动跳
+### 第二步：自动跳
 
 ```bash
-python jump_pc.py run
+python jump_pc.py
 ```
 
-首次运行会自动识别区域。脚本会自动将游戏窗口拉到前台。
+每次运行自动通过 Windows API 查找标题含「跳一跳」的窗口、获取**客户区**（`GetClientRect` + `ClientToScreen`，已排除标题栏和边框）作为游戏区域。匹配预览图存到 `debug/region_match.png`（黄框标注）。
+
+若自动识别失败（窗口标题不含"跳一跳"），会回退到**手动框选**模式。可修改脚本顶部 `WINDOW_TITLE` 常量匹配其他窗口标题，若模拟器内部有边栏可设置 `WINDOW_UI_OFFSET` 扣除。脚本会自动将游戏窗口拉到前台。
 
 ## 运行中热键
 
@@ -156,7 +146,6 @@ python jump_pc.py run
 ```
 tyt/
 ├── jump_pc.py              # 主脚本（识别 + 物理模型 + 自动跳跃）
-├── config.json             # 配置（游戏区域、按压系数）
 ├── requirements.txt        # Python 依赖
 ├── README.md
 ├── .gitignore
@@ -179,19 +168,7 @@ tyt/
 
 ## 配置
 
-`config.json` 示例：
-
-```json
-{
-  "region": [1035, 235, 490, 914],
-  "press_coefficient": 2.0
-}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `region` | 游戏画面在屏幕上的矩形区域 `[左, 上, 宽, 高]`（物理像素） |
-| `press_coefficient` | 按压时间倍率微调（默认 2.0，一般无需修改） |
+所有参数均为脚本顶部常量，无需外部配置文件。
 
 ### 可调参数（脚本顶部常量）
 
@@ -207,4 +184,3 @@ tyt/
 ## License
 
 MIT
-| `phys_k` | 屏幕像素与 3D 距离的比例系数，自动校准 |
