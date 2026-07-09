@@ -73,7 +73,15 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
-DEBUG_SAVE = False  # 仅当命令行传入 debug 参数时才保存截图到 debug/ 目录
+DEBUG_SAVE = True  # 仅当命令行传入 debug 参数时才保存截图到 debug/ 目录
+DEBUG_LANDING_OVERLAY_MS = 10  # 落地标注叠加层显示时长 (ms)
+
+
+def clear_debug_dir():
+    """清空 debug 目录。"""
+    import shutil
+    if os.path.isdir(DEBUG_DIR):
+        shutil.rmtree(DEBUG_DIR, ignore_errors=True)
 
 # --- 棋子颜色范围（默认皮肤，深蓝灰“小人”），沿用 wangshub 的经验值 ---
 # 若你换了棋子皮肤导致识别不到，改这里的 RGB 区间。
@@ -148,6 +156,10 @@ PHYS_JITTER = 0           # 三角分布对称抖动 ±2%
 # 再截图识别，将识别耗时与按压重叠，每次跳跃节省约 70ms。
 OVERLAP_MS = 0          # 按压首段时长（ms），在此期间完成截图+识别
 
+# --- 方向自适应补偿（基于 363 跳纯物理模型实测）---
+# True=开启方向分参补偿（UR ×1.005, UL ×1.012），False=关闭（仅用纯物理公式）
+PHYS_DIR_COMPENSATION = True
+
 
 def calc_k(W):
     """由游戏窗口短边像素 W，通过正交相机参数精确计算比例系数 k。
@@ -171,11 +183,14 @@ def x_of_h(h):
     return vz * t_air
 
 
-def calc_press_ms(dist_px, W):
+def calc_press_ms(dist_px, W, direction=None):
     """根据屏幕像素距离 D 和游戏窗口短边 W，用完整物理模型（含 min 上限）二分反解按压时间。
 
     D = k·x(h)，其中 x(h) = min(70h,150)·2·min(135+15h,180)/720。
     由于 x(h) 单调递增，直接用二分法求解 h，无需分段解析，对所有距离都精确。
+
+    direction: 'UR'（目标在棋子右侧）或 'UL'（目标在棋子左侧），用于方向分参补偿。
+               363 跳实测最优：UR ×1.005, UL ×1.012，补偿后两方向均值均在 ±0.2px 以内。
     返回按压毫秒数。
     """
     if dist_px <= 0:
@@ -191,6 +206,12 @@ def calc_press_ms(dist_px, W):
         else:
             hi = mid
     h = (lo + hi) * 0.5
+
+    # 方向分参补偿（363 跳实测最优）：UR ×1.005, UL ×1.012
+    # 补偿后两方向均值均在 ±0.2px 以内
+    if PHYS_DIR_COMPENSATION:
+        h *= 1.005 if direction == 'UR' else 1.012
+
     return h * 1000.0
 
 
@@ -358,6 +379,7 @@ def auto_detect_region():
         return None, f"窗口「{win_title}」尺寸异常 {region}（可能已最小化？）"
 
     if DEBUG_SAVE:
+        clear_debug_dir()
         os.makedirs(DEBUG_DIR, exist_ok=True)
         with mss.MSS() as sct:
             mon = sct.monitors[0]
@@ -394,7 +416,8 @@ def find_center_dot(img_rgb, near_xy, top_ignore, scale):
     找到 => 上一跳完美，返回精确中心 (x, y)；否则 None。
 
     near_xy: 几何法推出的目标中心，用来把搜索限制在它周围，排除背景浅色的误检。
-    只在这个窗口里找、颜色精确等于 F5F5F5、包围盒 ≤50×50、形状近椭圆，一起过滤。
+    只在这个窗口里找、颜色精确等于 F5F5F5、包围盒 ≤50×50、形状近椭圆，
+    且候选中心距几何估算中心 ≤10px，一起过滤。
     使用 cv2.fitEllipse 对轮廓拟合椭圆取几何中心（比像素质心更精准），
     按面积最大选择候选（白点只有一个，面积最大的就是它）。
     """
@@ -402,8 +425,10 @@ def find_center_dot(img_rgb, near_xy, top_ignore, scale):
     nx, ny = near_xy
     half_w = max(14, int(w * CENTER_DOT_WIN_X))
     half_h = max(14, int(h * CENTER_DOT_WIN_Y))
-    x0 = max(0, nx - half_w); x1 = min(w, nx + half_w)
-    y0 = max(top_ignore, ny - half_h); y1 = min(h, ny + half_h)
+    x0 = max(0, int(nx - half_w)); x1 = min(w, int(nx + half_w))
+    y0 = max(top_ignore, int(ny - half_h)); y1 = min(h, int(ny + half_h))
+    # 确保切片索引为纯 Python int（numpy 索引要求）
+    x0, x1, y0, y1 = int(x0), int(x1), int(y0), int(y1)
     if x1 - x0 < 4 or y1 - y0 < 4:
         return None
 
@@ -441,9 +466,13 @@ def find_center_dot(img_rgb, near_xy, top_ignore, scale):
                 ecx, ecy = bx + bw / 2.0, by + bh / 2.0
         else:
             ecx, ecy = bx + bw / 2.0, by + bh / 2.0
+        # 候选中心距几何估算中心超过 10px 的视为误检，直接丢弃
+        cx, cy = x0 + ecx, y0 + ecy
+        if math.hypot(cx - nx, cy - ny) > 10.0:
+            continue
         if area > best_area:
             best_area = area
-            best_center = (int(round(x0 + ecx)), int(round(y0 + ecy)))
+            best_center = (cx, cy)
 
     return best_center
 
@@ -474,8 +503,8 @@ def find_piece_and_board(img_rgb, top_ignore_ratio=0.20):
     ys, xs = np.where(filtered)
     if xs.size < 10:
         return None
-    piece_x = int(round(xs.mean()))
-    piece_y = max(0, int(ys.max()) - base_lift)
+    piece_x = float(xs.mean())
+    piece_y = max(0.0, float(ys.max()) - base_lift)
 
     # 从上往下找下一块的顶点：逐行与该行最左像素（背景）比较，取首个明显差异像素
     # 对棋子掩码做小幅膨胀，确保完全排除棋子边缘像素，避免棋子比目标块高时被误识别
@@ -493,7 +522,7 @@ def find_piece_and_board(img_rgb, top_ignore_ratio=0.20):
         cand = cand[~piece_exclusion[y, cand]]
         cand = cand[np.abs(cand - piece_x) > piece_half]
         if cand.size > 0:
-            board_top_x = int(round(cand.mean()))
+            board_top_x = float(cand.mean())
             board_top_y = y
             found = True
             break
@@ -502,8 +531,7 @@ def find_piece_and_board(img_rgb, top_ignore_ratio=0.20):
 
     # 等距投影：目标中心相对棋子在 30° 斜线上（几何法，作为兜底与白点搜索的种子）
     board_x = board_top_x
-    board_y = max(0, min(h - 1,
-                        int(piece_y - abs(board_x - piece_x) * (math.sqrt(3) / 3.0))))
+    board_y = max(0.0, piece_y - abs(board_x - piece_x) * (math.sqrt(3) / 3.0))
 
     # 完美跳跃白点：若上一跳正中目标中心，本块正中心会有 F5F5F5 椭圆白点。
     # 命中就用它做更精确的中心校准，并据此判定“上一跳完美”。
@@ -541,22 +569,26 @@ def find_piece_position(img_rgb, top_ignore_ratio=0.20):
     ys, xs = np.where(filtered)
     if xs.size < 10:
         return None
-    piece_x = int(round(xs.mean()))
-    piece_y = max(0, int(ys.max()) - base_lift)
+    piece_x = float(xs.mean())
+    piece_y = max(0.0, float(ys.max()) - base_lift)
     return piece_x, piece_y
 
 
 def annotate(img_rgb, det, dist=None, info_lines=None):
     im = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     if det:
-        cv2.circle(im, (det.piece_x, det.piece_y), 8, (0, 255, 0), 2)      # 棋子 绿
-        cv2.circle(im, (det.board_x, det.board_y), 8, (0, 0, 255), 2)      # 目标 红
-        cv2.line(im, (det.piece_x, det.piece_y),
-                 (det.board_x, det.board_y), (255, 200, 0), 2)
+        # OpenCV 5.0+ 不接受浮点坐标，统一转为 int
+        px, py = int(det.piece_x), int(det.piece_y)
+        bx, by = int(det.board_x), int(det.board_y)
+        cv2.circle(im, (px, py), 8, (0, 255, 0), 2)      # 棋子 绿
+        cv2.circle(im, (bx, by), 8, (0, 0, 255), 2)      # 目标 红
+        cv2.line(im, (px, py),
+                 (bx, by), (255, 200, 0), 2)
         if det.dot is not None:
-            cv2.circle(im, det.dot, 5, (255, 0, 255), -1)                  # 完美白点 品红实心
-            txt_x = min(det.dot[0] + 8, im.shape[1] - 1)
-            txt_y = max(10, det.dot[1] - 8)
+            dx, dy = int(det.dot[0]), int(det.dot[1])
+            cv2.circle(im, (dx, dy), 5, (255, 0, 255), -1)                  # 完美白点 品红实心
+            txt_x = min(dx + 8, im.shape[1] - 1)
+            txt_y = max(10, dy - 8)
             cv2.putText(im, "PERFECT", (txt_x, txt_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         if dist is not None:
@@ -572,8 +604,9 @@ def annotate(img_rgb, det, dist=None, info_lines=None):
 def annotate_landing(img_rgb, piece_pos, target_pos, gap):
     """标注落地调试图：棋子实际落地位置（绿）、目标中心（红）、偏差线（黄）。"""
     im = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    px, py = piece_pos
-    tx, ty = target_pos
+    # OpenCV 5.0+ 不接受浮点坐标，统一转为 int
+    px, py = int(piece_pos[0]), int(piece_pos[1])
+    tx, ty = int(target_pos[0]), int(target_pos[1])
     cv2.circle(im, (px, py), 10, (0, 255, 0), 3)        # 实际棋子 绿
     cv2.circle(im, (tx, ty), 10, (0, 0, 255), 3)        # 目标中心 红
     cv2.line(im, (px, py), (tx, ty), (0, 255, 255), 2)  # 偏差线 黄
@@ -586,9 +619,235 @@ def annotate_landing(img_rgb, piece_pos, target_pos, gap):
     return im
 
 
+def annotate_landing_overlay(h, w, piece_pos, target_pos, gap):
+    """落地调试透明叠加层：仅标注，背景全透明。"""
+    im = np.zeros((h, w, 4), dtype=np.uint8)
+    A = 255
+    # OpenCV 5.0+ 不接受浮点坐标，统一转为 int
+    px, py = int(piece_pos[0]), int(piece_pos[1])
+    tx, ty = int(target_pos[0]), int(target_pos[1])
+    cv2.circle(im, (px, py), 10, (0, 255, 0, A), 3)        # 实际棋子 绿
+    cv2.circle(im, (tx, ty), 10, (0, 0, 255, A), 3)        # 目标中心 红
+    cv2.line(im, (px, py), (tx, ty), (0, 255, 255, A), 2)  # 偏差线 黄
+    cv2.putText(im, f"Landing Gap={gap:.1f}px", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255, A), 2)
+    cv2.putText(im, f"Piece=({px},{py})", (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200, A), 1)
+    cv2.putText(im, f"Target=({tx},{ty})", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200, A), 1)
+    return im
+
+
+def annotate_overlay(h, w, det, dist=None, info_lines=None):
+    """创建透明叠加层 BGRA 图像：背景全透明，仅标注线/圆/文字可见。"""
+    im = np.zeros((h, w, 4), dtype=np.uint8)  # BGRA，alpha=0 全透明
+    A = 255  # 标注不透明度
+    if det:
+        # OpenCV 5.0+ 不接受浮点坐标，统一转为 int
+        px, py = int(det.piece_x), int(det.piece_y)
+        bx, by = int(det.board_x), int(det.board_y)
+        cv2.circle(im, (px, py), 8, (0, 255, 0, A), 2)      # 棋子 绿
+        cv2.circle(im, (bx, by), 8, (0, 0, 255, A), 2)      # 目标 红
+        cv2.line(im, (px, py),
+                 (bx, by), (255, 200, 0, A), 2)
+        if det.dot is not None:
+            dx, dy = int(det.dot[0]), int(det.dot[1])
+            cv2.circle(im, (dx, dy), 5, (255, 0, 255, A), -1)                  # 完美白点 品红实心
+            txt_x = min(dx + 8, w - 1)
+            txt_y = max(10, dy - 8)
+            cv2.putText(im, "PERFECT", (txt_x, txt_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255, A), 2)
+        if dist is not None:
+            cv2.putText(im, f"dist={dist:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255, A), 2)
+        if info_lines:
+            for i, line in enumerate(info_lines):
+                cv2.putText(im, line, (10, 60 + i * 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200, A), 1)
+    return im
+
+
+# --- Win32 结构体定义（ctypes.wintypes 不包含这些）---
+if sys.platform == "win32":
+    import ctypes as _ct
+    from ctypes import wintypes as _w
+
+    class _BITMAPINFOHEADER(_ct.Structure):
+        _fields_ = [
+            ("biSize",          _w.DWORD),
+            ("biWidth",         _w.LONG),
+            ("biHeight",        _w.LONG),
+            ("biPlanes",        _w.WORD),
+            ("biBitCount",      _w.WORD),
+            ("biCompression",   _w.DWORD),
+            ("biSizeImage",     _w.DWORD),
+            ("biXPelsPerMeter", _w.LONG),
+            ("biYPelsPerMeter", _w.LONG),
+            ("biClrUsed",       _w.DWORD),
+            ("biClrImportant",  _w.DWORD),
+        ]
+
+    class _BITMAPINFO(_ct.Structure):
+        _fields_ = [
+            ("bmiHeader", _BITMAPINFOHEADER),
+        ]
+
+    class _BLENDFUNCTION(_ct.Structure):
+        _fields_ = [
+            ("BlendOp",             _w.BYTE),
+            ("BlendFlags",          _w.BYTE),
+            ("SourceConstantAlpha", _w.BYTE),
+            ("AlphaFormat",         _w.BYTE),
+        ]
+
+    # WPARAM/LPARAM 在 64 位下是指针大小，不能用 wintypes 的 32 位类型
+    _WPARAM = _ct.c_size_t    # UINT_PTR，无符号指针大小
+    _LPARAM = _ct.c_ssize_t   # LONG_PTR，有符号指针大小
+    _LRESULT = _ct.c_ssize_t  # LRESULT，有符号指针大小
+
+    _WNDPROC = _ct.WINFUNCTYPE(_LRESULT, _w.HWND, _w.UINT, _WPARAM, _LPARAM)
+
+    class _WNDCLASSW(_ct.Structure):
+        _fields_ = [
+            ("style",         _w.UINT),
+            ("lpfnWndProc",   _WNDPROC),
+            ("cbClsExtra",    _ct.c_int),
+            ("cbWndExtra",    _ct.c_int),
+            ("hInstance",     _w.HINSTANCE),
+            ("hIcon",         _w.HICON),
+            ("hCursor",       _w.HICON),      # HCURSOR 与 HICON 同类型
+            ("hbrBackground", _w.HBRUSH),
+            ("lpszMenuName",  _w.LPCWSTR),
+            ("lpszClassName", _w.LPCWSTR),
+        ]
+
+
+class ScreenOverlay:
+    """透明屏幕叠加层 — 在游戏窗口上方实时绘制调试标注，点击穿透到下层窗口。"""
+
+    def __init__(self):
+        self._hwnd = None
+        self._width = 0
+        self._height = 0
+
+    def create(self, left, top, width, height):
+        """创建覆盖在指定游戏区域上方的透明分层窗口。"""
+        if sys.platform != "win32":
+            return False
+        user32 = _ct.windll.user32
+        gdi32 = _ct.windll.gdi32
+        kernel32 = _ct.windll.kernel32
+
+        # 修正 DefWindowProcW 的参数类型为指针大小（ctypes 默认是 32 位）
+        user32.DefWindowProcW.argtypes = [_w.HWND, _w.UINT, _WPARAM, _LPARAM]
+        user32.DefWindowProcW.restype = _LRESULT
+
+        self._width = width
+        self._height = height
+
+        # 窗口过程回调（必须保持引用防止被 GC 回收）
+        @_WNDPROC
+        def _wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == 0x0002:  # WM_DESTROY
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        self._wnd_proc_ref = _wnd_proc
+
+        # 注册窗口类
+        wnd_class = _WNDCLASSW()
+        wnd_class.lpfnWndProc = self._wnd_proc_ref
+        wnd_class.hInstance = kernel32.GetModuleHandleW(None)
+        wnd_class.lpszClassName = "JumpPcDebugOverlay"
+        wnd_class.hbrBackground = gdi32.GetStockObject(5)  # NULL_BRUSH
+        atom = user32.RegisterClassW(_ct.byref(wnd_class))
+        if not atom:
+            return False
+
+        # WS_EX_LAYERED=分层窗口  WS_EX_TRANSPARENT=鼠标穿透  WS_EX_TOPMOST=置顶
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_TOPMOST = 0x00000008
+        WS_POPUP = 0x80000000
+        self._hwnd = user32.CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
+            "JumpPcDebugOverlay", "",
+            WS_POPUP,
+            left, top, width, height,
+            None, None, wnd_class.hInstance, None)
+        if not self._hwnd:
+            return False
+        user32.ShowWindow(self._hwnd, 1)  # SW_SHOWNORMAL
+        return True
+
+    def update(self, bgra_image):
+        """用 BGRA numpy 数组更新叠加层内容（背景 alpha=0 处透明）。"""
+        if self._hwnd is None:
+            return
+        user32 = _ct.windll.user32
+        gdi32 = _ct.windll.gdi32
+
+        h, w = bgra_image.shape[:2]
+        if w != self._width or h != self._height:
+            return
+
+        hdc_screen = user32.GetDC(None)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+
+        bmi = _BITMAPINFO()
+        bmi.bmiHeader.biSize = _ct.sizeof(_BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h  # 负数=top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+
+        if not bgra_image.flags['C_CONTIGUOUS']:
+            bgra_image = np.ascontiguousarray(bgra_image)
+        pv = bgra_image.ctypes.data_as(_ct.POINTER(_ct.c_byte))
+
+        hbm = gdi32.CreateDIBitmap(hdc_screen, _ct.byref(bmi.bmiHeader),
+                                   4, pv, _ct.byref(bmi), 0)  # CBM_INIT=4, DIB_RGB_COLORS=0
+        old_bm = gdi32.SelectObject(hdc_mem, hbm)
+
+        blend = _BLENDFUNCTION()
+        blend.BlendOp = 0      # AC_SRC_OVER
+        blend.BlendFlags = 0
+        blend.SourceConstantAlpha = 255
+        blend.AlphaFormat = 1  # AC_SRC_ALPHA（每像素 alpha）
+
+        pt_src = _w.POINT(0, 0)
+        size = _w.SIZE(w, h)
+        user32.UpdateLayeredWindow(self._hwnd, hdc_screen, None,
+                                   _ct.byref(size), hdc_mem,
+                                   _ct.byref(pt_src), 0,
+                                   _ct.byref(blend), 2)  # ULW_ALPHA=2
+
+        gdi32.SelectObject(hdc_mem, old_bm)
+        gdi32.DeleteObject(hbm)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
+
+    def hide(self):
+        if self._hwnd:
+            _ct.windll.user32.ShowWindow(self._hwnd, 0)
+
+    def clear(self):
+        """清除叠加层内容（恢复全透明），避免标注被下一次截图捕获。"""
+        if self._hwnd is not None and self._width > 0 and self._height > 0:
+            transparent = np.zeros((self._height, self._width, 4), dtype=np.uint8)
+            self.update(transparent)
+
+    def destroy(self):
+        if self._hwnd:
+            _ct.windll.user32.DestroyWindow(self._hwnd)
+            self._hwnd = None
+
+
 def cmd_test():
     region = detect_region()
     if DEBUG_SAVE:
+        clear_debug_dir()
         os.makedirs(DEBUG_DIR, exist_ok=True)
     with mss.MSS() as sct:
         img = grab(sct, region)
@@ -607,9 +866,19 @@ def cmd_test():
     press_ms = calc_press_ms(dist, W)
     settle_ms = calc_settle_ms(press_ms, dist, W)
     if DEBUG_SAVE:
+        annotated = annotate(img, det, dist)
         out = os.path.join(DEBUG_DIR, "test.png")
-        cv2.imwrite(out, annotate(img, det, dist))
+        cv2.imwrite(out, annotated)
         print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
+        # 实时叠加到游戏窗口上显示标注
+        h, w = img.shape[:2]
+        overlay_img = annotate_overlay(h, w, det, dist)
+        overlay = ScreenOverlay()
+        if overlay.create(region[0], region[1], region[2], region[3]):
+            overlay.update(overlay_img)
+            print("调试叠加层已显示在游戏窗口上方，按 Enter 关闭...")
+            input()
+            overlay.destroy()
     print(f"棋子=({px},{py})  目标=({bx},{by})  距离={dist:.1f}px")
     print(f"W={W} k={k:.3f} -> h={press_ms/1000:.3f}s  按压={press_ms:.0f}ms  停稳(公式)={settle_ms:.0f}ms")
     if det.perfect:
@@ -646,12 +915,13 @@ class Runner:
         y = t + int(h * 0.82) + random.randint(-8, 8)
         return x, y
 
-    def jump(self, dist):
+    def jump(self, dist, direction=None):
         """根据像素距离用物理模型计算按压毫秒数并执行长按。
 
+        direction: 'UR' 或 'UL'，用于方向自适应补偿。
         返回 (nominal_ms, actual_ms, settle_ms, jitter_factor)。
         """
-        nominal_ms = calc_press_ms(dist, self.W)
+        nominal_ms = calc_press_ms(dist, self.W, direction)
         actual_ms, jitter_factor = apply_jitter(nominal_ms)
         px, py = self.press_point()
         self.mouse.position = (px, py)
@@ -680,7 +950,15 @@ class Runner:
 
     def loop(self):
         if DEBUG_SAVE:
+            clear_debug_dir()
             os.makedirs(DEBUG_DIR, exist_ok=True)
+            self.overlay = ScreenOverlay()
+            if not self.overlay.create(self.region[0], self.region[1],
+                                        self.region[2], self.region[3]):
+                print("[警告] 无法创建调试叠加层，将仅保存截图文件")
+                self.overlay = None
+        else:
+            self.overlay = None
         focus_game_window()
         time.sleep(0.3)  # 等窗口切到前台稳定
         print(f"开始。W={self.W} k={self.k:.3f}（精确公式），空格暂停，d 存图，q 退出。")
@@ -711,6 +989,9 @@ class Runner:
                     time.sleep(OVERLAP_MS / 1000.0)
 
                 # ── 截图 + 识别（传统模式：按压前；重叠模式：按压期间，画面尚未变化）──
+                # 截图前先清除叠加层，避免上一帧标注被捕获干扰识别
+                if self.overlay is not None:
+                    self.overlay.clear()
                 t_grab0 = time.perf_counter()
                 img = grab(sct, self.region)
                 t_grab1 = time.perf_counter()
@@ -743,37 +1024,42 @@ class Runner:
                 elif n > 1:
                     self.combo_double = 1
 
-                # 物理计算
-                press_ms = calc_press_ms(dist, self.W)
+                # 方向判定：board_x > piece_x → UR（目标在棋子右侧），反之 → UL
+                jump_dir = 'UR' if bx > px else 'UL'
+                # 物理计算（含方向自适应补偿）
+                press_ms = calc_press_ms(dist, self.W, jump_dir)
                 settle_ms = calc_settle_ms(press_ms, dist, self.W, self.combo_double)
                 grab_ms = (t_grab1 - t_grab0) * 1000.0
                 rec_ms = (t_rec1 - t_grab1) * 1000.0
                 total_ms = (t_rec1 - t_grab0) * 1000.0
 
                 # ── 日志与调试 ──
-                since_prev = ("" if loop_prev is None
-                              else f" 距上次识别={(t_rec1 - loop_prev) * 1000.0:.0f}ms")
                 loop_prev = t_rec1
 
-                # 非完美跳 debug 存图
-                if DEBUG_SAVE and n > 1 and not det.perfect and self.prev_img is not None:
+                # ── debug 模式：无论是否完美，每次识别都保存标注截图 + 叠加到游戏窗口 ──
+                if DEBUG_SAVE:
+                    # 构建信息行
                     info_lines = [
-                        f"Jump #{self.prev_n}  [NOT PERFECT]",
-                        f"Time: {time.strftime('%H:%M:%S')}",
-                        f"Distance: {self.prev_dist:.1f} px",
-                        f"W: {self.W}  k: {self.k:.3f}",
-                        f"Press(nom): {self.prev_press_ms:.0f} ms",
-                        f"Settle(est): {self.prev_settle_ms:.0f} ms",
-                        f"Piece: ({self.prev_det.piece_x}, {self.prev_det.piece_y})",
-                        f"Board: ({self.prev_det.board_x}, {self.prev_det.board_y})",
-                        f"BoardTop: ({self.prev_det.board_top_x}, {self.prev_det.board_top_y})",
-                        f"WhiteDot: NO",
+                        f"Jump #{n}  {time.strftime('%H:%M:%S')}",
+                        f"D={dist:.2f}px  h={press_ms/1000:.2f}s  press={press_ms:.0f}ms  settle={settle_ms:.0f}ms",
+                        f"Piece=({px:.2f},{py:.2f})  Board=({bx:.2f},{by:.2f})",
+                        f"BoardTop=({det.board_top_x:.2f},{det.board_top_y:.2f})  W={self.W}  k={self.k:.3f}",
                     ]
+                    if det.perfect:
+                        info_lines.append(f"WhiteDot=YES ({det.dot[0]:.2f},{det.dot[1]:.2f})  PERFECT")
+                    else:
+                        info_lines.append(f"WhiteDot=NO  NOT PERFECT")
+                    # 保存标注截图到文件（BGR，完整背景）
                     cv2.imwrite(
-                        os.path.join(DEBUG_DIR, f"non_perfect_{self.prev_n:04d}.png"),
-                        annotate(self.prev_img, self.prev_det, self.prev_dist, info_lines))
+                        os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
+                        annotate(img, det, dist, info_lines))
+                    # 叠加透明标注到游戏窗口（BGRA，仅标注可见）
+                    if self.overlay is not None:
+                        h, w = img.shape[:2]
+                        overlay_img = annotate_overlay(h, w, det, dist, info_lines)
+                        self.overlay.update(overlay_img)
 
-                # 保存当前帧为上一跳状态
+                # 保存当前帧为上一跳状态（保留兼容，用于 landing 调试等）
                 self.prev_img = img.copy()
                 self.prev_det = det
                 self.prev_dist = dist
@@ -782,52 +1068,62 @@ class Runner:
                 self.prev_settle_ms = settle_ms
 
                 # 日志输出
-                dot_seg = f"白点=有{det.dot}" if det.perfect else "白点=无"
+                dot_seg = f"白点=有({det.dot[0]:.2f},{det.dot[1]:.2f})" if det.perfect else "白点=无"
                 combo_seg = f"combo={self.combo_double}x halo={_halo_ms(self.combo_double):.0f}ms"
                 if n == 1:
-                    perfect_seg = f" {dot_seg}(首帧,无上一跳可判)"
+                    perfect_seg = f" {dot_seg} (首帧)"
                 elif det.perfect:
-                    perfect_seg = (f" {dot_seg} 上跳=完美 校准x{det.board_top_x}->{bx} "
+                    perfect_seg = (f" {dot_seg} 上跳=完美 校准{det.board_top_x:.2f}->{bx:.2f} "
                                    f"完美{perfect_total}/{n - 1} {combo_seg}")
                 else:
                     perfect_seg = f" {dot_seg} 上跳=偏 完美{perfect_total}/{n - 1} {combo_seg}"
                 h_sec = press_ms / 1000.0
-                if t_press_start is not None:
-                    overlap_info = f" 重叠已按={(t_rec1 - t_press_start) * 1000.0:.0f}ms"
-                else:
-                    overlap_info = ""
                 print(f"#{n} [{time.strftime('%H:%M:%S')}.{int((t_rec1 % 1) * 1000):03d}] "
-                      f"D={dist:.1f}px W={self.W} k={self.k:.3f} h={h_sec:.3f}s "
-                      f"按压(名义)={press_ms:.0f}ms 抖动±{PHYS_JITTER*100:.0f}% "
-                      f"停稳(公式)={settle_ms:.0f}ms "
-                      f"截图={grab_ms:.0f}ms 识别={rec_ms:.0f}ms 合计={total_ms:.0f}ms"
-                      f"{since_prev}{overlap_info}{perfect_seg}")
+                      f"D={dist:.2f}px h={h_sec:.2f}s "
+                      f"按压={press_ms:.0f}ms 停稳={settle_ms:.0f}ms "
+                      f"截图+识别={total_ms:.0f}ms"
+                      f" {jump_dir}{perfect_seg}")
 
                 # ── 执行跳跃 ──
                 if first_jump or OVERLAP_MS <= 0:
                     # 传统方式：按压全过程
-                    nominal_ms, actual_ms, actual_settle_ms, jitter_factor = self.jump(dist)
+                    nominal_ms, actual_ms, actual_settle_ms, jitter_factor = self.jump(dist, jump_dir)
                     # ── 落地调试：等待飞行时间（落地瞬间，画面未移动，棋子正立）──
                     h_debug = press_ms / 1000.0
                     v_y_debug = min(PHYS_VY0 + PHYS_VY_INC * h_debug, PHYS_VY_MAX)
                     t_air_ms_debug = 2.0 * v_y_debug / PHYS_G * 1000.0
                     time.sleep(t_air_ms_debug / 1000.0)
+                    if self.overlay is not None:
+                        self.overlay.clear()
                     land_img = grab(sct, self.region)
                     land_piece = find_piece_position(land_img)
+                    overlay_spent = 0.0  # 叠加层显示耗时 (ms)，从停稳时间中扣除
                     if land_piece is not None:
                         land_px, land_py = land_piece
-                        land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
+                        # 偏差投影到跳跃方向上（正=过冲，负=不足）
+                        dx, dy = jump_tx - px, jump_ty - py
+                        dir_len = math.hypot(dx, dy)
+                        land_gap = ((land_px - jump_tx) * dx + (land_py - jump_ty) * dy) / dir_len if dir_len > 0 else 0.0
                         if DEBUG_SAVE:
                             cv2.imwrite(
                                 os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
                                 annotate_landing(land_img, land_piece,
                                                  (jump_tx, jump_ty), land_gap))
-                        print(f"  [落地调试] 棋子=({land_px},{land_py}) "
-                              f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
+                        # 落地标注叠加到游戏窗口，显示 0.1s 后清除
+                        if self.overlay is not None:
+                            lh, lw = land_img.shape[:2]
+                            self.overlay.update(
+                                annotate_landing_overlay(lh, lw, land_piece,
+                                                         (jump_tx, jump_ty), land_gap))
+                            time.sleep(DEBUG_LANDING_OVERLAY_MS / 1000.0)
+                            self.overlay.clear()
+                            overlay_spent = float(DEBUG_LANDING_OVERLAY_MS)
+                        print(f"  [落地] {jump_dir} 落点=({land_px:.2f},{land_py:.2f}) "
+                              f"目标=({jump_tx:.2f},{jump_ty:.2f}) 偏差={land_gap:+.2f}px")
                     else:
-                        print(f"  [落地调试] 棋子识别失败")
-                    # 等待剩余停稳时间
-                    remaining_settle = actual_settle_ms - t_air_ms_debug
+                        print(f"  [落地] 棋子识别失败")
+                    # 等待剩余停稳时间（已扣除叠加层显示耗时）
+                    remaining_settle = actual_settle_ms - t_air_ms_debug - overlay_spent
                     if remaining_settle > 0:
                         time.sleep(remaining_settle / 1000.0)
                     time.sleep(0.05)
@@ -846,25 +1142,43 @@ class Runner:
                     v_y_debug = min(PHYS_VY0 + PHYS_VY_INC * h_debug, PHYS_VY_MAX)
                     t_air_ms_debug = 2.0 * v_y_debug / PHYS_G * 1000.0
                     time.sleep(t_air_ms_debug / 1000.0)
+                    if self.overlay is not None:
+                        self.overlay.clear()
                     land_img = grab(sct, self.region)
                     land_piece = find_piece_position(land_img)
+                    overlay_spent = 0.0  # 叠加层显示耗时 (ms)，从停稳时间中扣除
                     if land_piece is not None:
                         land_px, land_py = land_piece
-                        land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
+                        # 偏差投影到跳跃方向上（正=过冲，负=不足）
+                        dx, dy = jump_tx - px, jump_ty - py
+                        dir_len = math.hypot(dx, dy)
+                        land_gap = ((land_px - jump_tx) * dx + (land_py - jump_ty) * dy) / dir_len if dir_len > 0 else 0.0
                         if DEBUG_SAVE:
                             cv2.imwrite(
                                 os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
                                 annotate_landing(land_img, land_piece,
                                                  (jump_tx, jump_ty), land_gap))
-                        print(f"  [落地调试] 棋子=({land_px},{land_py}) "
-                              f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
+                        # 落地标注叠加到游戏窗口，显示 0.1s 后清除
+                        if self.overlay is not None:
+                            lh, lw = land_img.shape[:2]
+                            self.overlay.update(
+                                annotate_landing_overlay(lh, lw, land_piece,
+                                                         (jump_tx, jump_ty), land_gap))
+                            time.sleep(DEBUG_LANDING_OVERLAY_MS / 1000.0)
+                            self.overlay.clear()
+                            overlay_spent = float(DEBUG_LANDING_OVERLAY_MS)
+                        print(f"  [落地] {jump_dir} 落点=({land_px:.2f},{land_py:.2f}) "
+                              f"目标=({jump_tx:.2f},{jump_ty:.2f}) 偏差={land_gap:+.2f}px")
                     else:
                         print(f"  [落地调试] 棋子识别失败")
-                    # 等待剩余停稳时间
-                    remaining_settle = max(0.0, settle_ms - t_air_ms_debug)
+                    # 等待剩余停稳时间（已扣除叠加层显示耗时）
+                    remaining_settle = max(0.0, settle_ms - t_air_ms_debug - overlay_spent)
                     if remaining_settle > 0:
                         time.sleep(remaining_settle / 1000.0)
                     time.sleep(0.05)
+        if DEBUG_SAVE:
+            if self.overlay is not None:
+                self.overlay.destroy()
         print("已退出。")
 
 def cmd_run():
