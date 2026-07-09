@@ -26,16 +26,16 @@
 
 用法（在本目录下）：
     pip install -r requirements.txt
-    python jump_pc.py            # 自动跳（默认；不保存截图）
-    python jump_pc.py debug      # 自动跳 + 保存调试截图到 debug/
-    python jump_pc.py test       # 截一帧看识别对不对（不保存截图）
-    python jump_pc.py test debug # 截一帧测识别 + 保存截图到 debug/
+    python jump_pc.py            # 自动跳（默认；不开启调试）
+    python jump_pc.py debug      # 自动跳 + 调试模式（叠加层；若 DEBUG_SAVE=True 则保存截图）
+    python jump_pc.py test       # 截一帧看识别对不对（不开启调试）
+    python jump_pc.py test debug # 截一帧测识别 + 调试模式（若 DEBUG_SAVE=True 则保存截图）
 
 自动识别区域：通过 Windows API 查找标题包含"跳一跳"的窗口，获取窗口**客户区**
 （GetClientRect + ClientToScreen，已自动排除标题栏和边框）作为游戏区域。
 W（游戏短边像素）= min(宽, 高) − WINDOW_UI_OFFSET，用于物理公式计算 k 值。
 （客户区已无窗口外框，WINDOW_UI_OFFSET 默认为 0；若模拟器内部有边栏可设正值扣除。）
-匹配预览图仅在 debug 模式下存到 debug/region_match.png。
+匹配预览图仅在 debug 模式且 DEBUG_SAVE=True 时存到 debug/region_match.png。
 若自动识别失败（如窗口标题不含"跳一跳"），会回退到手动框选模式。
 若需匹配其他窗口标题，修改脚本顶部 WINDOW_TITLE 常量即可。
 
@@ -73,7 +73,8 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
-DEBUG_SAVE = True  # 仅当命令行传入 debug 参数时才保存截图到 debug/ 目录
+DEBUG_MODE = False  # 由命令行 debug 参数控制，开启调试功能（叠加层、落地调试等）
+DEBUG_SAVE = False   # 是否保存调试截图到磁盘；仅当 DEBUG_MODE 也为 True 时才生效
 DEBUG_LANDING_OVERLAY_MS = 10  # 落地标注叠加层显示时长 (ms)
 
 
@@ -378,7 +379,7 @@ def auto_detect_region():
     if region[2] <= 10 or region[3] <= 10:
         return None, f"窗口「{win_title}」尺寸异常 {region}（可能已最小化？）"
 
-    if DEBUG_SAVE:
+    if DEBUG_SAVE and DEBUG_MODE:
         clear_debug_dir()
         os.makedirs(DEBUG_DIR, exist_ok=True)
         with mss.MSS() as sct:
@@ -846,14 +847,14 @@ class ScreenOverlay:
 
 def cmd_test():
     region = detect_region()
-    if DEBUG_SAVE:
+    if DEBUG_MODE:
         clear_debug_dir()
         os.makedirs(DEBUG_DIR, exist_ok=True)
     with mss.MSS() as sct:
         img = grab(sct, region)
     det = find_piece_and_board(img)
     if not det:
-        if DEBUG_SAVE:
+        if DEBUG_SAVE and DEBUG_MODE:
             cv2.imwrite(os.path.join(DEBUG_DIR, "test.png"),
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
             print(f"已存原始截图: {os.path.join(DEBUG_DIR, 'test.png')}")
@@ -865,11 +866,12 @@ def cmd_test():
     k = calc_k(W)
     press_ms = calc_press_ms(dist, W)
     settle_ms = calc_settle_ms(press_ms, dist, W)
-    if DEBUG_SAVE:
-        annotated = annotate(img, det, dist)
-        out = os.path.join(DEBUG_DIR, "test.png")
-        cv2.imwrite(out, annotated)
-        print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
+    if DEBUG_MODE:
+        if DEBUG_SAVE:
+            annotated = annotate(img, det, dist)
+            out = os.path.join(DEBUG_DIR, "test.png")
+            cv2.imwrite(out, annotated)
+            print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
         # 实时叠加到游戏窗口上显示标注
         h, w = img.shape[:2]
         overlay_img = annotate_overlay(h, w, det, dist)
@@ -949,7 +951,7 @@ class Runner:
             pass
 
     def loop(self):
-        if DEBUG_SAVE:
+        if DEBUG_MODE:
             clear_debug_dir()
             os.makedirs(DEBUG_DIR, exist_ok=True)
             self.overlay = ScreenOverlay()
@@ -1011,7 +1013,7 @@ class Runner:
                 jump_tx, jump_ty = bx, by
 
                 if self.dump:
-                    if DEBUG_SAVE:
+                    if DEBUG_SAVE and DEBUG_MODE:
                         cv2.imwrite(os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
                                     annotate(img, det, dist))
                     self.dump = False
@@ -1037,7 +1039,7 @@ class Runner:
                 loop_prev = t_rec1
 
                 # ── debug 模式：无论是否完美，每次识别都保存标注截图 + 叠加到游戏窗口 ──
-                if DEBUG_SAVE:
+                if DEBUG_MODE:
                     # 构建信息行
                     info_lines = [
                         f"Jump #{n}  {time.strftime('%H:%M:%S')}",
@@ -1050,9 +1052,10 @@ class Runner:
                     else:
                         info_lines.append(f"WhiteDot=NO  NOT PERFECT")
                     # 保存标注截图到文件（BGR，完整背景）
-                    cv2.imwrite(
-                        os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
-                        annotate(img, det, dist, info_lines))
+                    if DEBUG_SAVE:
+                        cv2.imwrite(
+                            os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
+                            annotate(img, det, dist, info_lines))
                     # 叠加透明标注到游戏窗口（BGRA，仅标注可见）
                     if self.overlay is not None:
                         h, w = img.shape[:2]
@@ -1104,7 +1107,7 @@ class Runner:
                         dx, dy = jump_tx - px, jump_ty - py
                         dir_len = math.hypot(dx, dy)
                         land_gap = ((land_px - jump_tx) * dx + (land_py - jump_ty) * dy) / dir_len if dir_len > 0 else 0.0
-                        if DEBUG_SAVE:
+                        if DEBUG_SAVE and DEBUG_MODE:
                             cv2.imwrite(
                                 os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
                                 annotate_landing(land_img, land_piece,
@@ -1153,7 +1156,7 @@ class Runner:
                         dx, dy = jump_tx - px, jump_ty - py
                         dir_len = math.hypot(dx, dy)
                         land_gap = ((land_px - jump_tx) * dx + (land_py - jump_ty) * dy) / dir_len if dir_len > 0 else 0.0
-                        if DEBUG_SAVE:
+                        if DEBUG_SAVE and DEBUG_MODE:
                             cv2.imwrite(
                                 os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
                                 annotate_landing(land_img, land_piece,
@@ -1176,9 +1179,8 @@ class Runner:
                     if remaining_settle > 0:
                         time.sleep(remaining_settle / 1000.0)
                     time.sleep(0.05)
-        if DEBUG_SAVE:
-            if self.overlay is not None:
-                self.overlay.destroy()
+        if self.overlay is not None:
+            self.overlay.destroy()
         print("已退出。")
 
 def cmd_run():
@@ -1192,18 +1194,20 @@ def cmd_run():
         listener.stop()
 
 def main():
-    global DEBUG_SAVE
+    global DEBUG_MODE
     set_dpi_aware()
     ap = argparse.ArgumentParser(description="跳一跳 电脑端自动脚本（图像识别）")
     ap.add_argument("cmd", nargs="?", default="run",
                     choices=["test", "run", "debug"],
-                    help="run=自动跳（默认）  test=测识别  debug=自动跳+保存调试截图")
+                    help="run=自动跳（默认）  test=测识别  debug=自动跳+调试模式")
     ap.add_argument("debug_opt", nargs="?", default=None, choices=["debug"],
-                    help="跟在 test 后使用: test debug = 测识别+保存截图")
+                    help="跟在 test 后使用: test debug = 测识别+调试模式")
     args = ap.parse_args()
     if args.cmd == "debug" or args.debug_opt == "debug":
-        DEBUG_SAVE = True
-        print("[DEBUG] 调试截图将保存到 debug/ 目录")
+        DEBUG_MODE = True
+        print("[DEBUG] 调试模式已开启")
+        if DEBUG_SAVE:
+            print("[DEBUG] 调试截图将保存到 debug/ 目录")
     if args.cmd == "test":
         cmd_test()
     else:
