@@ -26,14 +26,16 @@
 
 用法（在本目录下）：
     pip install -r requirements.txt
-    python jump_pc.py            # 自动跳（默认；自动识别区域；若自动识别失败则手动框选）
-    python jump_pc.py test       # 截一帧看识别对不对，会存 debug 标注图
+    python jump_pc.py            # 自动跳（默认；不保存截图）
+    python jump_pc.py debug      # 自动跳 + 保存调试截图到 debug/
+    python jump_pc.py test       # 截一帧看识别对不对（不保存截图）
+    python jump_pc.py test debug # 截一帧测识别 + 保存截图到 debug/
 
 自动识别区域：通过 Windows API 查找标题包含"跳一跳"的窗口，获取窗口**客户区**
 （GetClientRect + ClientToScreen，已自动排除标题栏和边框）作为游戏区域。
 W（游戏短边像素）= min(宽, 高) − WINDOW_UI_OFFSET，用于物理公式计算 k 值。
 （客户区已无窗口外框，WINDOW_UI_OFFSET 默认为 0；若模拟器内部有边栏可设正值扣除。）
-匹配预览图会存到 debug/region_match.png。
+匹配预览图仅在 debug 模式下存到 debug/region_match.png。
 若自动识别失败（如窗口标题不含"跳一跳"），会回退到手动框选模式。
 若需匹配其他窗口标题，修改脚本顶部 WINDOW_TITLE 常量即可。
 
@@ -71,6 +73,7 @@ except ImportError:
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEBUG_DIR = os.path.join(HERE, "debug")
+DEBUG_SAVE = False  # 仅当命令行传入 debug 参数时才保存截图到 debug/ 目录
 
 # --- 棋子颜色范围（默认皮肤，深蓝灰“小人”），沿用 wangshub 的经验值 ---
 # 若你换了棋子皮肤导致识别不到，改这里的 RGB 区间。
@@ -332,7 +335,7 @@ def focus_game_window():
     return True
 
 
-def auto_detect_region(save_debug=True):
+def auto_detect_region():
     """
     通过 Windows API 查找标题含 WINDOW_TITLE 的窗口，自动获取游戏区域。
     返回 (region, info)；失败时 region 为 None、info 为原因字符串。
@@ -354,7 +357,7 @@ def auto_detect_region(save_debug=True):
     if region[2] <= 10 or region[3] <= 10:
         return None, f"窗口「{win_title}」尺寸异常 {region}（可能已最小化？）"
 
-    if save_debug:
+    if DEBUG_SAVE:
         os.makedirs(DEBUG_DIR, exist_ok=True)
         with mss.MSS() as sct:
             mon = sct.monitors[0]
@@ -585,15 +588,17 @@ def annotate_landing(img_rgb, piece_pos, target_pos, gap):
 
 def cmd_test():
     region = detect_region()
-    os.makedirs(DEBUG_DIR, exist_ok=True)
+    if DEBUG_SAVE:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
     with mss.MSS() as sct:
         img = grab(sct, region)
     det = find_piece_and_board(img)
     if not det:
-        cv2.imwrite(os.path.join(DEBUG_DIR, "test.png"),
-                    cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if DEBUG_SAVE:
+            cv2.imwrite(os.path.join(DEBUG_DIR, "test.png"),
+                        cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            print(f"已存原始截图: {os.path.join(DEBUG_DIR, 'test.png')}")
         print("识别失败：没找到棋子或目标。请确认游戏画面在框内、棋子是默认皮肤。")
-        print(f"已存原始截图: {os.path.join(DEBUG_DIR, 'test.png')}")
         return
     px, py, bx, by = det.piece_x, det.piece_y, det.board_x, det.board_y
     dist = math.hypot(bx - px, by - py)
@@ -601,8 +606,10 @@ def cmd_test():
     k = calc_k(W)
     press_ms = calc_press_ms(dist, W)
     settle_ms = calc_settle_ms(press_ms, dist, W)
-    out = os.path.join(DEBUG_DIR, "test.png")
-    cv2.imwrite(out, annotate(img, det, dist))
+    if DEBUG_SAVE:
+        out = os.path.join(DEBUG_DIR, "test.png")
+        cv2.imwrite(out, annotate(img, det, dist))
+        print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
     print(f"棋子=({px},{py})  目标=({bx},{by})  距离={dist:.1f}px")
     print(f"W={W} k={k:.3f} -> h={press_ms/1000:.3f}s  按压={press_ms:.0f}ms  停稳(公式)={settle_ms:.0f}ms")
     if det.perfect:
@@ -610,7 +617,6 @@ def cmd_test():
               f"（几何顶点 x={det.board_top_x} -> 校准后 x={bx}）")
     else:
         print("未检测到中心白点 -> 上一跳非完美（或白点已消失），使用几何投影中心")
-    print(f"已存标注图: {out} （绿点=棋子落脚，红点=目标中心，品红=完美白点；不准就调颜色区间或区域）")
 
 class Runner:
     def __init__(self, region):
@@ -673,7 +679,8 @@ class Runner:
             pass
 
     def loop(self):
-        os.makedirs(DEBUG_DIR, exist_ok=True)
+        if DEBUG_SAVE:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
         focus_game_window()
         time.sleep(0.3)  # 等窗口切到前台稳定
         print(f"开始。W={self.W} k={self.k:.3f}（精确公式），空格暂停，d 存图，q 退出。")
@@ -723,8 +730,9 @@ class Runner:
                 jump_tx, jump_ty = bx, by
 
                 if self.dump:
-                    cv2.imwrite(os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
-                                annotate(img, det, dist))
+                    if DEBUG_SAVE:
+                        cv2.imwrite(os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
+                                    annotate(img, det, dist))
                     self.dump = False
 
                 n += 1
@@ -748,7 +756,7 @@ class Runner:
                 loop_prev = t_rec1
 
                 # 非完美跳 debug 存图
-                if n > 1 and not det.perfect and self.prev_img is not None:
+                if DEBUG_SAVE and n > 1 and not det.perfect and self.prev_img is not None:
                     info_lines = [
                         f"Jump #{self.prev_n}  [NOT PERFECT]",
                         f"Time: {time.strftime('%H:%M:%S')}",
@@ -809,10 +817,11 @@ class Runner:
                     if land_piece is not None:
                         land_px, land_py = land_piece
                         land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
-                        cv2.imwrite(
-                            os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
-                            annotate_landing(land_img, land_piece,
-                                             (jump_tx, jump_ty), land_gap))
+                        if DEBUG_SAVE:
+                            cv2.imwrite(
+                                os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
+                                annotate_landing(land_img, land_piece,
+                                                 (jump_tx, jump_ty), land_gap))
                         print(f"  [落地调试] 棋子=({land_px},{land_py}) "
                               f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
                     else:
@@ -842,10 +851,11 @@ class Runner:
                     if land_piece is not None:
                         land_px, land_py = land_piece
                         land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
-                        cv2.imwrite(
-                            os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
-                            annotate_landing(land_img, land_piece,
-                                             (jump_tx, jump_ty), land_gap))
+                        if DEBUG_SAVE:
+                            cv2.imwrite(
+                                os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
+                                annotate_landing(land_img, land_piece,
+                                                 (jump_tx, jump_ty), land_gap))
                         print(f"  [落地调试] 棋子=({land_px},{land_py}) "
                               f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
                     else:
@@ -868,12 +878,18 @@ def cmd_run():
         listener.stop()
 
 def main():
+    global DEBUG_SAVE
     set_dpi_aware()
     ap = argparse.ArgumentParser(description="跳一跳 电脑端自动脚本（图像识别）")
     ap.add_argument("cmd", nargs="?", default="run",
-                    choices=["test", "run"],
-                    help="run=自动跳（默认）  test=测识别")
+                    choices=["test", "run", "debug"],
+                    help="run=自动跳（默认）  test=测识别  debug=自动跳+保存调试截图")
+    ap.add_argument("debug_opt", nargs="?", default=None, choices=["debug"],
+                    help="跟在 test 后使用: test debug = 测识别+保存截图")
     args = ap.parse_args()
+    if args.cmd == "debug" or args.debug_opt == "debug":
+        DEBUG_SAVE = True
+        print("[DEBUG] 调试截图将保存到 debug/ 目录")
     if args.cmd == "test":
         cmd_test()
     else:
