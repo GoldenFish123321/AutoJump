@@ -511,6 +511,38 @@ def find_piece_and_board(img_rgb, top_ignore_ratio=0.20):
     return Detection(piece_x, piece_y, board_x, board_y,
                      board_top_x, board_top_y, dot is not None, dot)
 
+
+def find_piece_position(img_rgb, top_ignore_ratio=0.20):
+    """仅定位棋子底部中心，返回 (piece_x, piece_y) 或 None。
+
+    从 find_piece_and_board 中提取棋子检测部分，用于落地瞬间截图调试：
+    落地后画面未移动、棋子正立，直接用颜色掩码定位棋子即可。
+    """
+    h, w, _ = img_rgb.shape
+    scale = w / 1080.0
+    base_lift = max(5, int(20 * scale))
+
+    r = img_rgb[:, :, 0].astype(np.int16)
+    g = img_rgb[:, :, 1].astype(np.int16)
+    b = img_rgb[:, :, 2].astype(np.int16)
+    mask = ((r > PIECE_R[0]) & (r < PIECE_R[1]) &
+            (g > PIECE_G[0]) & (g < PIECE_G[1]) &
+            (b > PIECE_B[0]) & (b < PIECE_B[1]))
+    # 取前两大连通域（棋子身体+头部），滤除零星噪点
+    n_lbl, lbls, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8), connectivity=8)
+    areas = [(int(stats[i, cv2.CC_STAT_AREA]), i) for i in range(1, n_lbl)]
+    areas.sort(reverse=True)
+    top2_labels = {i for _, i in areas[:2]}
+    filtered = np.isin(lbls, list(top2_labels))
+    ys, xs = np.where(filtered)
+    if xs.size < 10:
+        return None
+    piece_x = int(round(xs.mean()))
+    piece_y = max(0, int(ys.max()) - base_lift)
+    return piece_x, piece_y
+
+
 def annotate(img_rgb, det, dist=None, info_lines=None):
     im = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     if det:
@@ -532,6 +564,24 @@ def annotate(img_rgb, det, dist=None, info_lines=None):
                 cv2.putText(im, line, (10, 60 + i * 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
     return im
+
+
+def annotate_landing(img_rgb, piece_pos, target_pos, gap):
+    """标注落地调试图：棋子实际落地位置（绿）、目标中心（红）、偏差线（黄）。"""
+    im = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    px, py = piece_pos
+    tx, ty = target_pos
+    cv2.circle(im, (px, py), 10, (0, 255, 0), 3)        # 实际棋子 绿
+    cv2.circle(im, (tx, ty), 10, (0, 0, 255), 3)        # 目标中心 红
+    cv2.line(im, (px, py), (tx, ty), (0, 255, 255), 2)  # 偏差线 黄
+    cv2.putText(im, f"Landing Gap={gap:.1f}px", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    cv2.putText(im, f"Piece=({px},{py})", (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    cv2.putText(im, f"Target=({tx},{ty})", (10, 75),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    return im
+
 
 def cmd_test():
     region = detect_region()
@@ -669,6 +719,8 @@ class Runner:
 
                 px, py, bx, by = det.piece_x, det.piece_y, det.board_x, det.board_y
                 dist = math.hypot(bx - px, by - py)
+                # 保存本次跳跃目标中心，用于落地后偏差调试
+                jump_tx, jump_ty = bx, by
 
                 if self.dump:
                     cv2.imwrite(os.path.join(DEBUG_DIR, f"frame_{n:04d}.png"),
@@ -747,7 +799,28 @@ class Runner:
                 if first_jump or OVERLAP_MS <= 0:
                     # 传统方式：按压全过程
                     nominal_ms, actual_ms, actual_settle_ms, jitter_factor = self.jump(dist)
-                    time.sleep(actual_settle_ms / 1000.0)
+                    # ── 落地调试：等待飞行时间（落地瞬间，画面未移动，棋子正立）──
+                    h_debug = press_ms / 1000.0
+                    v_y_debug = min(PHYS_VY0 + PHYS_VY_INC * h_debug, PHYS_VY_MAX)
+                    t_air_ms_debug = 2.0 * v_y_debug / PHYS_G * 1000.0
+                    time.sleep(t_air_ms_debug / 1000.0)
+                    land_img = grab(sct, self.region)
+                    land_piece = find_piece_position(land_img)
+                    if land_piece is not None:
+                        land_px, land_py = land_piece
+                        land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
+                        cv2.imwrite(
+                            os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
+                            annotate_landing(land_img, land_piece,
+                                             (jump_tx, jump_ty), land_gap))
+                        print(f"  [落地调试] 棋子=({land_px},{land_py}) "
+                              f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
+                    else:
+                        print(f"  [落地调试] 棋子识别失败")
+                    # 等待剩余停稳时间
+                    remaining_settle = actual_settle_ms - t_air_ms_debug
+                    if remaining_settle > 0:
+                        time.sleep(remaining_settle / 1000.0)
                     time.sleep(0.05)
                     if OVERLAP_MS > 0:
                         first_jump = False
@@ -759,7 +832,28 @@ class Runner:
                     if remaining_ms > 0:
                         time.sleep(remaining_ms / 1000.0)
                     self.mouse.release(Button.left)
-                    time.sleep(settle_ms / 1000.0)
+                    # ── 落地调试：等待飞行时间（落地瞬间，画面未移动，棋子正立）──
+                    h_debug = press_ms / 1000.0
+                    v_y_debug = min(PHYS_VY0 + PHYS_VY_INC * h_debug, PHYS_VY_MAX)
+                    t_air_ms_debug = 2.0 * v_y_debug / PHYS_G * 1000.0
+                    time.sleep(t_air_ms_debug / 1000.0)
+                    land_img = grab(sct, self.region)
+                    land_piece = find_piece_position(land_img)
+                    if land_piece is not None:
+                        land_px, land_py = land_piece
+                        land_gap = math.hypot(land_px - jump_tx, land_py - jump_ty)
+                        cv2.imwrite(
+                            os.path.join(DEBUG_DIR, f"landing_{n:04d}.png"),
+                            annotate_landing(land_img, land_piece,
+                                             (jump_tx, jump_ty), land_gap))
+                        print(f"  [落地调试] 棋子=({land_px},{land_py}) "
+                              f"目标=({jump_tx},{jump_ty}) 偏差={land_gap:.1f}px")
+                    else:
+                        print(f"  [落地调试] 棋子识别失败")
+                    # 等待剩余停稳时间
+                    remaining_settle = max(0.0, settle_ms - t_air_ms_debug)
+                    if remaining_settle > 0:
+                        time.sleep(remaining_settle / 1000.0)
                     time.sleep(0.05)
         print("已退出。")
 
